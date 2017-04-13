@@ -46,6 +46,17 @@ class BackendTypes(object):
         pass
 
 
+def chop(data_list, chunk_size):
+    if sys.getsizeof(str(data_list)) <= chunk_size:
+        return [data_list]
+    elif len(data_list) == 1:
+        logger.warning("Too large piece of Telegraf data. Might experience upload problems.")
+        return [data_list]
+    else:
+        mid = len(data_list) / 2
+        return chop(data_list[:mid], chunk_size) + chop(data_list[mid:], chunk_size)
+
+
 class Plugin(AbstractPlugin, AggregateResultListener,
              MonitoringDataListener):
     SECTION = 'meta'
@@ -62,7 +73,7 @@ class Plugin(AbstractPlugin, AggregateResultListener,
         self.mon = None
         self.regression_component = None
         self.retcode = -1
-        self.target = None
+        self._target = None
         self.task_name = ''
         self.token_file = None
         self.version_tested = None
@@ -72,6 +83,7 @@ class Plugin(AbstractPlugin, AggregateResultListener,
         self.backend_type = BackendTypes.identify_backend(self.SECTION)
         self._task = None
         self._api_token = ''
+        self._lp_job = None
 
     @staticmethod
     def get_key():
@@ -108,7 +120,8 @@ class Plugin(AbstractPlugin, AggregateResultListener,
             'log_monitoring_requests',
             'log_status_requests',
             'log_other_requests',
-            'threads_timeout'
+            'threads_timeout',
+            'chunk_size'
         ]
         return opts
 
@@ -124,6 +137,7 @@ class Plugin(AbstractPlugin, AggregateResultListener,
             "target_lock_duration", "30m"))
         self.send_status_period = expand_to_seconds(
             self.get_option('send_status_period', '10'))
+        self.chunk_size = int(self.get_option("chunk_size", '500000'))
 
     def check_task_is_open(self):
         if self.backend_type == BackendTypes.OVERLOAD:
@@ -181,9 +195,7 @@ class Plugin(AbstractPlugin, AggregateResultListener,
             os.getcwd())
 
     def prepare_test(self):
-        info = self.core.job.generator_plugin.get_info()
-        self.target = info.address
-        logger.info("Detected target: %s", self.target)
+        info = self.generator_info
         port = info.port
         instances = info.instances
         if info.ammo_file.startswith(
@@ -191,25 +203,24 @@ class Plugin(AbstractPlugin, AggregateResultListener,
             ammo_path = info.ammo_file
         else:
             ammo_path = os.path.realpath(info.ammo_file)
-        loadscheme = [] if isinstance(info.rps_schedule,
-                                      str) else info.rps_schedule
         duration = int(info.duration)
         if duration:
             self.lock_target_duration = duration
         loop_count = info.loop_count
 
-        self.lp_job = self.__get_lp_job(self.target, port, loadscheme)
+        lp_job = self.lp_job
         self.locked_targets = self.check_and_lock_targets(strict=bool(
             int(self.get_option('strict_lock', '0'))), ignore=self.ignore_target_lock)
 
         try:
-            if self.lp_job._number:
-                self.make_symlink(self.lp_job._number)
+            if lp_job._number:
+                self.make_symlink(lp_job._number)
                 self.check_task_is_open()
             else:
                 self.check_task_is_open()
-                self.lp_job.create()
-                self.make_symlink(self.lp_job.number)
+                lp_job.create()
+                self.make_symlink(lp_job.number)
+            self.core.publish(self.SECTION, 'jobno', lp_job.number)
         except (APIClient.JobNotCreated, APIClient.NotAvailable, APIClient.NetworkError) as e:
             logger.error(e.message)
             logger.error(
@@ -221,7 +232,7 @@ class Plugin(AbstractPlugin, AggregateResultListener,
             return
 
         cmdline = ' '.join(sys.argv)
-        self.lp_job.edit_metainfo(
+        lp_job.edit_metainfo(
             instances=instances,
             ammo_path=ammo_path,
             loop_count=loop_count,
@@ -350,7 +361,7 @@ class Plugin(AbstractPlugin, AggregateResultListener,
             if len(data_list) > 0:
                 if self.is_telegraf:
                     # telegraf
-                    self.monitoring_queue.put(data_list)
+                    [self.monitoring_queue.put(chunk) for chunk in chop(data_list, self.chunk_size)]
                 else:
                     # monitoring
                     [self.monitoring_queue.put(data) for data in data_list]
@@ -548,10 +559,22 @@ class Plugin(AbstractPlugin, AggregateResultListener,
                       user_agent=self._get_user_agent(),
                       api_token=self.api_token)
 
-    def __get_lp_job(self, target, port, loadscheme):
+    @property
+    def lp_job(self):
+        if self._lp_job is None:
+            self._lp_job = self.__get_lp_job()
+        return self._lp_job
+
+    def __get_lp_job(self):
         api_client = self.__get_api_client()
+
+        info = self.generator_info
+        port = info.port
+        loadscheme = [] if isinstance(info.rps_schedule,
+                                      str) else info.rps_schedule
+
         return LPJob(client=api_client,
-                     target_host=target,
+                     target_host=self.target,
                      target_port=port,
                      number=self.get_option('jobno', ''),
                      token=self.get_option('upload_token', ''),
@@ -611,6 +634,19 @@ class Plugin(AbstractPlugin, AggregateResultListener,
                 "Get your Overload API token from https://overload.yandex.net and provide it via 'overload.token_file' parameter"
             )
             raise RuntimeError("API token error")
+
+    @property
+    def generator_info(self):
+        if self._generator_info is None:
+            self._generator_info = self.core.job.generator_plugin.get_info()
+        return self._generator_info
+
+    @property
+    def target(self):
+        if self._target is None:
+            self._target = self.generator_info.address
+            logger.info("Detected target: %s", self.target)
+        return self._target
 
 
 class JobInfoWidget(AbstractInfoWidget):
@@ -779,12 +815,16 @@ class LPJob(object):
                 self.number, self.token, data, trace=self.log_monitoring_requests)
 
     def lock_target(self, lock_target, lock_target_duration, ignore, strict):
+        lock_wait_timeout = 10
+        maintenance_timeouts = iter([0]) if ignore else iter(lambda: lock_wait_timeout, 0)
         while True:
             try:
-                self.api_client.lock_target(
-                    lock_target,
-                    lock_target_duration,
-                    trace=self.log_other_requests)
+                self.api_client.lock_target(lock_target, lock_target_duration, trace=self.log_other_requests,
+                                            maintenance_timeouts=maintenance_timeouts,
+                                            maintenance_msg="Target is locked.\nManual unlock link: %s%s" % (
+                                                self.api_client.base_url,
+                                                self.api_client.get_manual_unlock_link(lock_target)
+                                            ))
                 return True
             except (APIClient.NotAvailable, APIClient.StoppedFromOnline) as e:
                 logger.info('Target is not locked due to %s', e.message)
@@ -798,12 +838,11 @@ class LPJob(object):
                     return False
             except APIClient.UnderMaintenance:
                 logger.info('Target is locked')
-                logger.info("Manual unlock link: %s%s", self.api_client.base_url,
-                            self.api_client.get_manual_unlock_link(lock_target))
                 if ignore:
                     logger.info('ignore_target_locks = 1')
                     return False
-                time.sleep(10)
+                logger.info("Manual unlock link: %s%s", self.api_client.base_url,
+                            self.api_client.get_manual_unlock_link(lock_target))
                 continue
 
     def set_imbalance_and_dsc(self, rps, comment):

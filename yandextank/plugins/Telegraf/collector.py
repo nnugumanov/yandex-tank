@@ -93,16 +93,17 @@ class MonitoringCollector(object):
                     return 0
                 for chunk in collect:
                     ts, prepared_results = chunk
-                    ready_to_send = {
-                        "timestamp": int(ts),
-                        "data": {
-                            self.hash_hostname(agent.host): {
-                                "comment": agent.config.comment,
-                                "metrics": prepared_results
+                    if self.load_start_time and int(ts) >= self.load_start_time:
+                        ready_to_send = {
+                            "timestamp": int(ts),
+                            "data": {
+                                self.hash_hostname(agent.host): {
+                                    "comment": agent.config.comment,
+                                    "metrics": prepared_results
+                                }
                             }
                         }
-                    }
-                    self.__collected_data.append(ready_to_send)
+                        self.__collected_data.append(ready_to_send)
 
         logger.debug(
             'Polling/decoding agents data took: %.2fms',
@@ -134,10 +135,19 @@ class MonitoringCollector(object):
 
     def send_collected_data(self):
         """sends pending data set to listeners"""
-        data = copy.deepcopy(self.__collected_data)
+        data = self.__collected_data
         self.__collected_data = []
         for listener in self.listeners:
+            # deep copy to ensure each listener gets it's own copy
             listener.monitoring_data(copy.deepcopy(data))
+
+    def not_empty(self):
+        return len(self.__collected_data) > 0
+
+    def send_rest_data(self):
+        while self.not_empty():
+            logger.info("Sending monitoring data rests...")
+            self.send_collected_data()
 
     def hash_hostname(self, host):
         if self.disguise_hostnames and host:
