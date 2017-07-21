@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='yandextank',
-    version='1.8.29-11',
+    version='1.8.35',
     description='a performance measurement tool',
     longer_description='''
 Yandex.Tank is a performance measurement and load testing automatization tool.
@@ -47,6 +47,7 @@ analytic tools for the results they produce.
         'console_scripts': [
             'yandex-tank = yandextank.core.cli:main',
             'yandex-tank-check-ssh = yandextank.common.util:check_ssh_connection',
+            'tank-postloader = yandextank.plugins.DataUploader.cli:post_loader'
         ],
     },
     package_data={
@@ -60,5 +61,6 @@ analytic tools for the results they produce.
         'yandextank.plugins.Pandora': ['config/*'],
         'yandextank.plugins.Aggregator': ['config/*'],
         'yandextank.plugins.Telegraf': ['config/*'],
+        'yandextank.plugins.Android': ['binary/*'],
     },
     use_2to3=False, )
